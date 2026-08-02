@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from plugin.relay.config import _load_profiles, _read_proc_start_time
+from plugin.relay.config import _load_profiles, _pid_is_alive, _read_proc_start_time
 
 
 class ProfileDiscoveryTests(unittest.TestCase):
@@ -231,6 +234,34 @@ class ProfileDiscoveryTests(unittest.TestCase):
         self.assertEqual(entry["model"], "unknown")
 
     # ── enrichment: gateway_running / has_soul / skill_count ────────────
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-probe regression")
+    def test_pid_probe_never_calls_os_kill_on_windows(self) -> None:
+        """Windows signal zero is a console event, not a POSIX liveness probe."""
+        with patch(
+            "plugin.relay.config.os.kill",
+            side_effect=AssertionError("os.kill must not probe Windows PIDs"),
+        ):
+            self.assertTrue(_pid_is_alive(os.getpid()))
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-probe regression")
+    def test_pid_probe_never_terminates_live_windows_process(self) -> None:
+        """Signal 0 is destructive on Windows and must never be used as a probe."""
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        try:
+            self.assertTrue(_pid_is_alive(child.pid))
+            time.sleep(0.2)
+            self.assertIsNone(
+                child.poll(),
+                "Windows liveness probe terminated the process it inspected",
+            )
+        finally:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
 
     def test_gateway_running_true_when_pid_file_points_at_live_process(
         self,

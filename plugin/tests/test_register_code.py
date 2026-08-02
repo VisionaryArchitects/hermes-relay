@@ -30,6 +30,7 @@ from urllib.parse import parse_qs, urlparse
 from unittest.mock import patch
 
 from plugin import cli, pair
+from plugin.relay.auth import PairingManager
 
 
 # ── normalize_pairing_code ───────────────────────────────────────────────────
@@ -86,6 +87,41 @@ class NormalizePairingCodeTests(unittest.TestCase):
     def test_rejects_unicode(self) -> None:
         with self.assertRaises(pair.InvalidPairingCodeError):
             pair.normalize_pairing_code("ABCDé2")
+
+
+class PairingClaimRecoveryTests(unittest.TestCase):
+    def test_same_device_can_recover_just_created_session(self) -> None:
+        manager = PairingManager()
+        manager.register_code("ABCD12")
+        self.assertIsNotNone(manager.consume_code("ABCD12"))
+        manager.remember_claim("ABCD12", "phone-123", "session-456")
+
+        self.assertEqual(
+            manager.recover_claim("abcd12", "phone-123"), "session-456"
+        )
+        self.assertFalse(manager.validate_code("ABCD12"))
+
+    def test_other_device_cannot_replay_claim(self) -> None:
+        manager = PairingManager()
+        manager.remember_claim("ABCD12", "phone-123", "session-456")
+
+        self.assertIsNone(manager.recover_claim("ABCD12", "phone-999"))
+        self.assertEqual(
+            manager.recover_claim("ABCD12", "phone-123"), "session-456"
+        )
+
+    def test_expired_claim_cannot_be_recovered(self) -> None:
+        manager = PairingManager()
+        manager.remember_claim("ABCD12", "phone-123", "session-456")
+        manager._recent_claims["ABCD12"].expires_at = 0
+
+        self.assertIsNone(manager.recover_claim("ABCD12", "phone-123"))
+
+    def test_placeholder_device_id_gets_no_recovery_window(self) -> None:
+        manager = PairingManager()
+        manager.remember_claim("ABCD12", "unknown", "session-456")
+
+        self.assertIsNone(manager.recover_claim("ABCD12", "unknown"))
 
 
 # ── register_code_command ───────────────────────────────────────────────────

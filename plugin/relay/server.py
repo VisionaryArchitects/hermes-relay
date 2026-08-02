@@ -3681,6 +3681,18 @@ async def _authenticate(
     # Try pairing code
     if pairing_code:
         metadata = server.pairing.consume_code(pairing_code)
+        if metadata is None:
+            recovered_token = server.pairing.recover_claim(pairing_code, device_id)
+            if recovered_token:
+                recovered_session = server.sessions.get_session(recovered_token)
+                if recovered_session is not None:
+                    server.rate_limiter.record_success(remote_ip)
+                    await _send_system(
+                        ws,
+                        "auth.ok",
+                        _build_auth_ok_payload(recovered_session, server),
+                    )
+                    return recovered_session.token
         if metadata is not None:
             # Thread host-side metadata (from /pairing/register) through
             # to the session. Fall back to phone-sent values, then to
@@ -3710,6 +3722,7 @@ async def _authenticate(
                 device_form_factor=device_form_factor,
                 issue_refresh_token=True,
             )
+            server.pairing.remember_claim(pairing_code, device_id, session.token)
             server.rate_limiter.record_success(remote_ip)
             await _send_system(
                 ws, "auth.ok", _build_auth_ok_payload(session, server)
