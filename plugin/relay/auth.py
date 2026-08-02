@@ -330,6 +330,24 @@ class _PairingEntry:
         return time.time() > self.expires_at
 
 
+_PAIRING_CLAIM_REPLAY_SECONDS = 30.0
+
+
+@dataclass
+class _RecentPairingClaim:
+    """A just-created session recoverable by the same pairing device."""
+
+    device_id: str
+    session_token: str
+    expires_at: float = field(
+        default_factory=lambda: time.time() + _PAIRING_CLAIM_REPLAY_SECONDS
+    )
+
+    @property
+    def is_expired(self) -> bool:
+        return time.time() > self.expires_at
+
+
 # ── Pairing manager ─────────────────────────────────────────────────────────
 
 
@@ -341,6 +359,7 @@ class PairingManager:
 
     def __init__(self) -> None:
         self._codes: dict[str, _PairingEntry] = {}
+        self._recent_claims: dict[str, _RecentPairingClaim] = {}
 
     def generate_code(self) -> str:
         """Generate and register a new random pairing code."""
@@ -417,11 +436,48 @@ class PairingManager:
         logger.info("Pairing code %s consumed", normalized)
         return entry.metadata
 
+    def remember_claim(
+        self, code: str, device_id: str, session_token: str
+    ) -> None:
+        """Keep a short, device-bound recovery path for a consumed code.
+
+        Mobile networks can drop the first WebSocket after the relay creates
+        the session but before the client receives ``auth.ok``. The code is
+        still one-time: only the same non-placeholder device can recover the
+        exact session minted by that claim, and only for 30 seconds.
+        """
+        normalized_device = str(device_id or "").strip()
+        if not normalized_device or normalized_device.lower() == "unknown":
+            return
+        self._cleanup()
+        normalized_code = str(code or "").upper().strip()
+        self._recent_claims[normalized_code] = _RecentPairingClaim(
+            device_id=normalized_device,
+            session_token=session_token,
+        )
+
+    def recover_claim(self, code: str, device_id: str) -> str | None:
+        """Return a recent session token only to its original device."""
+        self._cleanup()
+        normalized_code = str(code or "").upper().strip()
+        normalized_device = str(device_id or "").strip()
+        claim = self._recent_claims.get(normalized_code)
+        if claim is None or not normalized_device:
+            return None
+        if not secrets.compare_digest(claim.device_id, normalized_device):
+            return None
+        return claim.session_token
+
     def _cleanup(self) -> None:
         """Remove expired codes."""
         expired = [k for k, v in self._codes.items() if v.is_expired]
         for k in expired:
             del self._codes[k]
+        expired_claims = [
+            key for key, claim in self._recent_claims.items() if claim.is_expired
+        ]
+        for key in expired_claims:
+            del self._recent_claims[key]
 
 
 # ── Session manager ──────────────────────────────────────────────────────────

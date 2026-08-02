@@ -707,17 +707,46 @@ def _extract_description_from_soul(soul_text: str) -> str:
 def _pid_is_alive(pid: int) -> bool:
     """Return True if ``pid`` refers to a live process on this host.
 
-    Uses the POSIX ``os.kill(pid, 0)`` "probe" pattern — signal 0 performs
-    the permission/existence check without delivering a real signal. On
-    Windows, ``os.kill`` with signal 0 on CPython is implemented via
-    ``OpenProcess`` and returns success for live PIDs, ``OSError`` with
-    ``EINVAL``/``ESRCH``/``EPERM``-ish errno for dead or inaccessible
-    ones. We treat any ``OSError`` as "not running" — we prefer
-    false-negatives here (the gateway will simply be flagged offline) to
-    false-positives that would claim a dead daemon is live.
+    POSIX supports the non-delivering ``os.kill(pid, 0)`` probe. Windows does
+    not share that contract: signal zero is ``CTRL_C_EVENT`` there, so using
+    it as a liveness check can disturb the exact gateway being inspected.
+    Native Windows probes therefore open a synchronization handle and perform
+    a zero-time wait without signalling the target.
     """
     if pid <= 0:
         return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            synchronize = 0x00100000
+            wait_timeout = 0x00000102
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_process.restype = wintypes.HANDLE
+
+            wait_for_single_object = kernel32.WaitForSingleObject
+            wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            wait_for_single_object.restype = wintypes.DWORD
+
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+
+            handle = open_process(synchronize, False, pid)
+            if not handle:
+                return False
+            try:
+                return wait_for_single_object(handle, 0) == wait_timeout
+            finally:
+                close_handle(handle)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+
     try:
         os.kill(pid, 0)
     except OSError:
@@ -737,6 +766,8 @@ def _read_proc_start_time(pid: int) -> int | None:
     second stat field — ``comm`` — may contain spaces/parens, so we parse
     by finding the last ``)`` and tokenizing the tail.
     """
+    if os.name != "posix":
+        return None
     proc_stat = Path(f"/proc/{pid}/stat")
     try:
         raw = proc_stat.read_text(encoding="utf-8", errors="replace")
@@ -771,6 +802,9 @@ def _pid_matches_hermes(pid: int) -> bool:
     when we successfully read a cmdline/comm that definitely is NOT
     hermes-related.
     """
+    if os.name != "posix":
+        return True
+
     comm_path = Path(f"/proc/{pid}/comm")
     cmdline_path = Path(f"/proc/{pid}/cmdline")
 
@@ -820,11 +854,10 @@ def _probe_gateway_running(profile_home: Path) -> bool:
       ``hermes`` or ``gateway``. A PID pointing at (say) ``init`` or
       ``sshd`` reports ``False``.
 
-    On platforms without ``/proc`` (Windows/macOS dev hosts) these
-    secondary checks degrade to "don't penalize" — the primary
-    ``os.kill(pid, 0)`` probe still runs. Returns ``False`` on any
-    filesystem or parse error — the feature is advisory, not
-    load-bearing.
+    On platforms without ``/proc`` (Windows/macOS dev hosts) these secondary
+    checks degrade to "don't penalize". Windows uses a non-signalling native
+    process-handle probe; POSIX uses ``os.kill(pid, 0)``. Returns ``False`` on
+    any filesystem or parse error — the feature is advisory, not load-bearing.
     """
     pid_file = profile_home / "gateway.pid"
     try:
